@@ -1,0 +1,90 @@
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+.env.*
+*.sqlite
+*.db
+
+# -----------------------------
+# Jupyter Notebooks
+# -----------------------------
+.ipynb_checkpoints/
+
+# -----------------------------
+# VS Code
+# -----------------------------
+.vscode/
+.history/
+
+# -----------------------------
+# macOS system files
+# -----------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# -----------------------------
+# Windows system files
+# -----------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# -----------------------------
+# Logs and cache
+# -----------------------------
+*.log
+logs/
+.cache/
+coverage/
+htmlcov/
+
+# -----------------------------
+# Azure Functions local files
+# -----------------------------
+local.settings.json
+bin/
+obj/
+
+# -----------------------------
+# Terraform / IaC state files
+# -----------------------------
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+override.tf
+override.tf.json
+.terraform.lock.hcl
+
+# -----------------------------
+# Node (only used if you add UI tooling)
+# -----------------------------
+node_modules/
+
+# -----------------------------
+# Power BI
+# -----------------------------
+# PBIX files are massive; track them in Git LFS instead of Git
+# Uncomment below ONLY if you do not want PBIX in git:
+# *.pbix
+
+# Keep Power BI template files
+*.pbit
+
+# -----------------------------
+# Archives
+# -----------------------------
+*.zip
+*.tar
+*.gz
