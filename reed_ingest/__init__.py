@@ -78,6 +78,15 @@ SKILL_GROUPS: Dict[str, set] = {
 # Flat set used for matching (backwards-compatible)
 SKILL_PATTERNS = set().union(*SKILL_GROUPS.values())
 
+# Job role categories - map role keywords to standardized category names
+# Format: 'category_name': {'keywords', 'to', 'match'}
+JOB_ROLE_CATEGORIES: Dict[str, set] = {
+    'Engineering': {'engineer', 'developer', 'devops', 'infrastructure', 'platform'},
+    'Analyst': {'analyst', 'analytics', 'business intelligence', 'bi', 'data analyst'},
+    'Scientist': {'scientist', 'research', 'machine learning', 'ml engineer'},
+    'Architect': {'architect', 'architecture'},
+}
+
 # Map skill variations to canonical names
 # Format: 'variation': 'canonical_name'
 SKILL_ALIASES = {
@@ -155,6 +164,7 @@ def load_config() -> Dict[str, Any]:
 
     # Reed API basics
     cfg["API_KEY"] = _must_get("API_KEY")
+    cfg["API_KEY_BACKUP"] = os.getenv("API_KEY_BACKUP", "")  # Fallback key for rate limit handling
     cfg["API_BASE_URL"] = _must_get("API_BASE_URL")
     cfg["SEARCH_KEYWORDS"] = os.getenv("SEARCH_KEYWORDS", "data")
     cfg["RESULTS_PER_PAGE"] = int(os.getenv("RESULTS_PER_PAGE", "50"))
@@ -220,6 +230,18 @@ def load_config() -> Dict[str, Any]:
         # Use default aliases
         cfg["SKILL_ALIASES"] = SKILL_ALIASES
 
+    # Job role categories (format: {"Category1": ["keyword1", "keyword2"], "Category2": [...]})
+    role_categories_json = os.getenv("JOB_ROLE_CATEGORIES", "")
+    if role_categories_json:
+        try:
+            user_categories = json.loads(role_categories_json)
+            cfg["JOB_ROLE_CATEGORIES"] = {k: set(v) for k, v in user_categories.items()}
+        except json.JSONDecodeError as e:
+            print(f"⚠️ JOB_ROLE_CATEGORIES JSON invalid, using defaults: {e}")
+            cfg["JOB_ROLE_CATEGORIES"] = JOB_ROLE_CATEGORIES
+    else:
+        cfg["JOB_ROLE_CATEGORIES"] = JOB_ROLE_CATEGORIES
+
     return cfg
 
 
@@ -283,6 +305,7 @@ def ensure_staging_table(conn):
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         work_location_type TEXT,
         seniority_level TEXT,
+        job_role_category TEXT,
         contract_type   TEXT,
         full_time       BOOLEAN,
         part_time       BOOLEAN,
@@ -295,6 +318,7 @@ def ensure_staging_table(conn):
         # Ensure columns exist if table was created previously
         cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS work_location_type TEXT;")
         cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS seniority_level TEXT;")
+        cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS job_role_category TEXT;")
         cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS contract_type TEXT;")
         cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS full_time BOOLEAN;")
         cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS part_time BOOLEAN;")
@@ -351,7 +375,7 @@ def upsert_jobs(conn, rows: List[Tuple]):
     conn.commit()
 
 
-def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = None, include_terms: List[str] = None, exclude_terms: List[str] = None):
+def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = None, include_terms: List[str] = None, exclude_terms: List[str] = None, job_role_categories: Dict[str, set] = None):
     """
     Transform landing.raw_jobs → staging.jobs_v1
     Extracts and flattens JSON fields from raw column
@@ -361,6 +385,7 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
         conn: Database connection
         skill_patterns: Set of skills to extract (uses default if None)
         skill_aliases: Dict mapping variations to canonical names (uses default if None)
+        job_role_categories: Dict mapping role category names to keyword sets (uses default if None)
     """
     # First, fetch job descriptions that need skill extraction
     # Build filtered selection of jobs from landing.raw_jobs based on title include/exclude
@@ -389,6 +414,11 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
     # Extract skills and detect work location type for each job
     skills_map: Dict[Tuple[str, str], List[str]] = {}
     location_map: Dict[Tuple[str, str], str] = {}
+    seniority_map: Dict[Tuple[str, str], str] = {}
+    role_category_map: Dict[Tuple[str, str], Optional[str]] = {}
+    salary_fallback_map: Dict[Tuple[str, str], Tuple[Optional[float], Optional[float]]] = {}
+    salary_type_map: Dict[Tuple[str, str], Optional[str]] = {}
+    employment_map: Dict[Tuple[str, str], Tuple[Optional[bool], Optional[bool], Optional[str]]] = {}
     # rows of (source_name, job_id, category, canonical)
     job_skill_pairs: List[Tuple[str, str, str, str]] = []
     # Build reverse map pattern -> category for fast lookup
@@ -396,8 +426,10 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
     for cat, patterns in SKILL_GROUPS.items():
         for p in patterns:
             pattern_category[p] = cat
-    # Map to store seniority levels
-    seniority_map: Dict[Tuple[str, str], str] = {}
+    
+    # Use provided job role categories or default
+    if job_role_categories is None:
+        job_role_categories = JOB_ROLE_CATEGORIES
     
     for job_id, source_name, title, description in jobs:
         # Extract skills using the updated extract_skills function (min length filter applied there)
@@ -409,6 +441,16 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
         # Detect seniority level
         seniority = detect_seniority_level(title, description)
         seniority_map[(source_name, job_id)] = seniority
+        # Detect job role category
+        role_category = detect_job_role_category(title, job_role_categories)
+        role_category_map[(source_name, job_id)] = role_category
+        # Parse salary from description when API fields are missing
+        sal_min, sal_max, _ = parse_salary_from_text(description)
+        salary_fallback_map[(source_name, job_id)] = (sal_min, sal_max)
+        salary_type_inferred = detect_salary_type(title, description)
+        salary_type_map[(source_name, job_id)] = salary_type_inferred
+        # Detect employment terms (full/part time, contract type)
+        employment_map[(source_name, job_id)] = detect_employment_terms(title, description)
         # Accumulate job-skill rows (source_name, job_id, category, skill)
         for canonical in canonical_skills:
             cat = pattern_category.get(canonical)
@@ -472,12 +514,13 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
         for (source_name, job_id), skills in skills_map.items():
             location_type = location_map.get((source_name, job_id), 'unknown')
             seniority = seniority_map.get((source_name, job_id), 'mid')
+            role_category = role_category_map.get((source_name, job_id))
             cur.execute("""
                 INSERT INTO staging.jobs_v1 (
                     source_name, job_id, job_title, employer_name, employer_id,
                     location_name, salary_min, salary_max, job_url,
                     applications, job_description, work_location_type, seniority_level,
-                    contract_type, full_time, part_time, salary_type,
+                    job_role_category, contract_type, full_time, part_time, salary_type,
                     posted_at, expires_at, ingested_at, updated_at
                 )
                 SELECT 
@@ -487,17 +530,18 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
                     raw->>'employerName' as employer_name,
                     (raw->>'employerId')::bigint as employer_id,
                     raw->>'locationName' as location_name,
-                    (raw->>'minimumSalary')::numeric as salary_min,
-                    (raw->>'maximumSalary')::numeric as salary_max,
+                    COALESCE((raw->>'minimumSalary')::numeric, %s) as salary_min,
+                    COALESCE((raw->>'maximumSalary')::numeric, %s) as salary_max,
                     raw->>'jobUrl' as job_url,
                     (raw->>'applications')::int as applications,
                     raw->>'jobDescription' as job_description,
                     %s as work_location_type,
                     %s as seniority_level,
-                    raw->>'contractType' as contract_type,
-                    (raw->>'fullTime')::boolean as full_time,
-                    (raw->>'partTime')::boolean as part_time,
-                    raw->>'salaryType' as salary_type,
+                    %s as job_role_category,
+                    COALESCE(raw->>'contractType', %s) as contract_type,
+                    COALESCE((raw->>'fullTime')::boolean, %s) as full_time,
+                    COALESCE((raw->>'partTime')::boolean, %s) as part_time,
+                    COALESCE(raw->>'salaryType', %s) as salary_type,
                     posted_at,
                     expires_at,
                     ingested_at,
@@ -516,6 +560,7 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
                     job_description = EXCLUDED.job_description,
                     work_location_type = EXCLUDED.work_location_type,
                     seniority_level = EXCLUDED.seniority_level,
+                    job_role_category = EXCLUDED.job_role_category,
                     contract_type = EXCLUDED.contract_type,
                     full_time = EXCLUDED.full_time,
                     part_time = EXCLUDED.part_time,
@@ -523,7 +568,19 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
                     posted_at = EXCLUDED.posted_at,
                     expires_at = EXCLUDED.expires_at,
                     updated_at = NOW();
-            """, (location_type, seniority, source_name, job_id))
+            """, (
+                salary_fallback_map.get((source_name, job_id), (None, None))[0],
+                salary_fallback_map.get((source_name, job_id), (None, None))[1],
+                location_type,
+                seniority,
+                role_category,
+                employment_map.get((source_name, job_id), (None, None, None))[2],
+                employment_map.get((source_name, job_id), (None, None, None))[0],
+                employment_map.get((source_name, job_id), (None, None, None))[1],
+                salary_type_map.get((source_name, job_id)),
+                source_name,
+                job_id,
+            ))
         
         row_count = len(skills_map)
     
@@ -567,6 +624,7 @@ def fetch_page(
     results_per_page: int,
     page: int,
     api_key: str,
+    api_key_backup: Optional[str] = None,
     posted_by_days: Optional[int] = None
 ) -> Dict[str, Any]:
     """
@@ -576,12 +634,15 @@ def fetch_page(
     Optionally filters to jobs posted within N days via postedByDays parameter
     (0 = all jobs, >0 = incremental mode).
     
+    Falls back to backup API key on 403 Forbidden errors (rate limiting).
+    
     Args:
         base_url: Reed API base URL (https://www.reed.co.uk/api/1.0/search)
         keywords: Search keyword string (comma-separated for multiple)
         results_per_page: Page size (typically 50)
         page: Page number (1-based)
         api_key: Reed API authentication key
+        api_key_backup: Backup API key for rate limit fallback (optional)
         posted_by_days: Filter to jobs posted in last N days (optional)
         
     Returns:
@@ -600,9 +661,24 @@ def fetch_page(
     if posted_by_days and posted_by_days > 0:
         params["postedByDays"] = posted_by_days
     
-    # Use requests' built-in Basic Auth
-    resp = requests.get(base_url, params=params, auth=(api_key, ""))
-    resp.raise_for_status()
+    # Try primary API key first
+    try:
+        resp = requests.get(base_url, params=params, auth=(api_key, ""))
+        resp.raise_for_status()
+        return resp.json()
+    except requests.HTTPError as e:
+        # On 403 Forbidden (rate limit), try backup key if available
+        if e.response.status_code == 403 and api_key_backup:
+            print(f"⚠️ Primary API key rate limited (403); switching to backup key")
+            try:
+                resp = requests.get(base_url, params=params, auth=(api_key_backup, ""))
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as backup_err:
+                print(f"⚠️ Backup API key also failed: {backup_err}")
+                raise e  # Re-raise original error
+        else:
+            raise
     return resp.json()
 
 
@@ -641,6 +717,134 @@ def parse_iso(dt: Optional[str]) -> Optional[datetime]:
         return d.replace(tzinfo=timezone.utc)
     except Exception:
         return None
+
+
+def parse_salary_from_text(description: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """Extract salary min/max from free text when API fields are missing.
+
+    Returns (min_salary, max_salary, currency_guess) where currency is 'GBP'
+    when a pound sign/GBP hint is present, else None.
+    """
+    if not description:
+        return None, None, None
+
+    text = description.lower()
+    currency = 'GBP' if '£' in description or 'gbp' in text or 'per annum' in text else None
+
+    def _to_number(token: str, has_k: bool) -> Optional[float]:
+        try:
+            clean = token.replace(',', '')
+            num = float(clean)
+            return num * 1000 if has_k else num
+        except Exception:
+            return None
+
+    # Patterns to capture ranges
+    range_patterns = [
+        r"£?\s?(?P<min>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<min_k>k)?\s*(?:to|-|–|—)\s*£?\s?(?P<max>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<max_k>k)?",
+        r"between\s+£?\s?(?P<min>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<min_k>k)?\s+and\s+£?\s?(?P<max>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<max_k>k)?",
+        r"from\s+£?\s?(?P<min>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<min_k>k)?\s+(?:to|up to)\s+£?\s?(?P<max>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<max_k>k)?",
+    ]
+
+    for pat in range_patterns:
+        m = re.search(pat, description, re.IGNORECASE)
+        if m:
+            min_val = _to_number(m.group('min'), bool(m.group('min_k')))
+            max_val = _to_number(m.group('max'), bool(m.group('max_k')))
+            if min_val is not None and max_val is not None:
+                lo, hi = sorted((min_val, max_val))
+                return lo, hi, currency
+
+    # Single-sided patterns: "up to 50k", "from 45k"
+    up_to = re.search(r"up to\s+£?\s?(?P<max>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<max_k>k)?", description, re.IGNORECASE)
+    from_only = re.search(r"from\s+£?\s?(?P<min>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<min_k>k)?", description, re.IGNORECASE)
+    if up_to:
+        max_val = _to_number(up_to.group('max'), bool(up_to.group('max_k')))
+        if max_val is not None:
+            return max_val, max_val, currency
+    if from_only:
+        min_val = _to_number(from_only.group('min'), bool(from_only.group('min_k')))
+        if min_val is not None:
+            return min_val, min_val, currency
+
+    # Fallback: grab first two numeric tokens (supports k suffix)
+    number_pattern = re.compile(r"£?\s?(\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(k)?")
+    numbers = []
+    for n, kflag in number_pattern.findall(description):
+        val = _to_number(n, bool(kflag))
+        if val is not None:
+            numbers.append(val)
+
+    if not numbers:
+        return None, None, currency
+    if len(numbers) == 1:
+        return numbers[0], numbers[0], currency
+
+    lo, hi = sorted(numbers[:2])
+    return lo, hi, currency
+
+
+def detect_salary_type(title: str, description: str) -> Optional[str]:
+    """Infer salary type from title/description text.
+
+    Returns one of: 'per annum', 'per month', 'per week', 'per day', 'per hour', or None.
+    """
+    text = f"{title or ''} {description or ''}".lower()
+
+    pa_tokens = [
+        'per annum', 'p.a', 'p.a.', 'pa ', ' pa', 'pa/', 'p/a', 'annual', 'annum', 'a year', 'per year', 'yearly'
+    ]
+    month_tokens = ['per month', 'pcm', 'p.c.m', '/month']
+    week_tokens = ['per week', 'pw ', ' pw', 'p/w', '/week', 'weekly']
+    day_tokens = ['per day', 'pd ', ' pd', 'p/d', '/day', 'day rate', 'daily']
+    hour_tokens = ['per hour', 'ph ', ' ph', 'p/h', '/hour', 'hourly']
+
+    if any(tok in text for tok in pa_tokens):
+        return 'per annum'
+    if any(tok in text for tok in month_tokens):
+        return 'per month'
+    if any(tok in text for tok in week_tokens):
+        return 'per week'
+    if any(tok in text for tok in day_tokens):
+        return 'per day'
+    if any(tok in text for tok in hour_tokens):
+        return 'per hour'
+    return None
+
+
+def detect_employment_terms(title: str, description: str) -> Tuple[Optional[bool], Optional[bool], Optional[str]]:
+    """Infer full_time, part_time, and contract_type from title/description text.
+
+    contract_type one of: 'permanent', 'fixed term', 'contract', 'temporary', else None.
+    """
+    text = f"{title or ''} {description or ''}".lower()
+
+    full_terms = ['full time', 'full-time', 'fulltime', 'ft role']
+    part_terms = ['part time', 'part-time', 'parttime', 'pt role']
+
+    perm_terms = ['permanent', 'perm role', 'perm position', 'perm basis']
+    fixed_terms = ['fixed term', 'ftc', 'fixed-term']
+    contract_terms = ['contract role', 'contract position', 'contract basis', 'on contract']
+    temp_terms = ['temporary', 'temp role', 'temp position', 'interim']
+
+    full_time = True if any(tok in text for tok in full_terms) else None
+    part_time = True if any(tok in text for tok in part_terms) else None
+
+    contract_type = None
+    if any(tok in text for tok in perm_terms):
+        contract_type = 'permanent'
+    elif any(tok in text for tok in fixed_terms):
+        contract_type = 'fixed term'
+    elif any(tok in text for tok in contract_terms):
+        contract_type = 'contract'
+    elif any(tok in text for tok in temp_terms):
+        contract_type = 'temporary'
+
+    # If we know it is permanent and nothing suggests part-time, assume full-time
+    if full_time is None and contract_type == 'permanent' and part_time is not True:
+        full_time = True
+
+    return full_time, part_time, contract_type
 
 
 def extract_skills(description: str, skill_patterns: set = None, skill_aliases: dict = None) -> List[str]:
@@ -1079,8 +1283,47 @@ def detect_seniority_level(title: str, description: str) -> str:
     return 'mid'
 
 
+def detect_job_role_category(title: str, job_role_categories: Dict[str, set] = None) -> Optional[str]:
+    """
+    Classify job into a role category based on job title keywords.
+    
+    Detection:
+      - Checks job title for keywords matching predefined role categories
+      - Returns the first matching category (priority order follows config order)
+      - Falls back to 'Other' if no match
+    
+    Args:
+        title: Job title string
+        job_role_categories: Dict mapping category names to keyword sets
+        
+    Returns:
+        One of the category names from job_role_categories, or 'Other' if no match
+        
+    Example:
+        >>> categories = {'Engineering': {'engineer', 'developer'}, 'Analyst': {'analyst'}}
+        >>> detect_job_role_category('Senior Data Engineer', categories)
+        'Engineering'
+        >>> detect_job_role_category('Product Manager', categories)
+        'Other'
+    """
+    if not title or not job_role_categories:
+        return 'Other'
+    
+    title_lower = title.lower()
+    
+    # Check each category in order
+    for category_name, keywords in job_role_categories.items():
+        for keyword in keywords:
+            # Use word boundary matching to prevent partial matches
+            pattern = r'\b' + re.escape(keyword) + r'\b'
+            if re.search(pattern, title_lower):
+                return category_name
+    
+    return 'Other'
+
+
 def stable_hash(obj: Any) -> str:
-    # Hash canonical JSON to detect content changes
+    """Hash canonical JSON to detect content changes"""
     enc = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(enc).hexdigest()
 
@@ -1251,6 +1494,7 @@ def main(mytimer: func.TimerRequest) -> None:
             cfg["RESULTS_PER_PAGE"],
             page=1,
             api_key=cfg["API_KEY"],
+            api_key_backup=cfg.get("API_KEY_BACKUP"),
             posted_by_days=cfg["POSTED_BY_DAYS"],
         )
     except Exception as e:
@@ -1294,6 +1538,7 @@ def main(mytimer: func.TimerRequest) -> None:
                     cfg["RESULTS_PER_PAGE"],
                     page=p,
                     api_key=cfg["API_KEY"],
+                    api_key_backup=cfg.get("API_KEY_BACKUP"),
                     posted_by_days=cfg["POSTED_BY_DAYS"],
                 )
             except Exception as e:
@@ -1457,7 +1702,8 @@ def main(mytimer: func.TimerRequest) -> None:
                 cfg["SKILL_PATTERNS"],
                 cfg["SKILL_ALIASES"],
                 cfg.get("JOB_TITLE_INCLUDE", []),
-                cfg.get("JOB_TITLE_EXCLUDE", [])
+                cfg.get("JOB_TITLE_EXCLUDE", []),
+                cfg.get("JOB_ROLE_CATEGORIES", JOB_ROLE_CATEGORIES)
             )
             print(f"📦 Staging: upserted {staging_count} rows into staging.jobs_v1")
             
