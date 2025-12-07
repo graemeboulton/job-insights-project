@@ -389,27 +389,51 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
     """
     # First, fetch job descriptions that need skill extraction
     # Build filtered selection of jobs from landing.raw_jobs based on title include/exclude
+    # NOTE: Filtering happens in Python (not SQL) to use same word boundary logic as main()
     include_terms = include_terms or []
     exclude_terms = exclude_terms or []
-    where_clauses = ["raw->>'jobDescription' IS NOT NULL", "raw->>'jobTitle' IS NOT NULL"]
-    params: List[str] = []
-    if include_terms:
-        inc_pred = "(" + " OR ".join(["lower(raw->>'jobTitle') LIKE %s" for _ in include_terms]) + ")"
-        where_clauses.append(inc_pred)
-        params.extend([f"%{t.lower()}%" for t in include_terms])
-    if exclude_terms:
-        exc_pred = "NOT (" + " OR ".join(["lower(raw->>'jobTitle') LIKE %s" for _ in exclude_terms]) + ")"
-        where_clauses.append(exc_pred)
-        params.extend([f"%{t.lower()}%" for t in exclude_terms])
-    where_sql = " AND ".join(where_clauses)
-    sel_sql = f"""
+    
+    # Fetch all jobs from landing that have descriptions
+    sel_sql = """
         SELECT job_id, source_name, raw->>'jobTitle' as title, raw->>'jobDescription' as description
         FROM landing.raw_jobs
-        WHERE {where_sql}
+        WHERE raw->>'jobDescription' IS NOT NULL AND raw->>'jobTitle' IS NOT NULL
     """
     with conn.cursor() as cur:
-        cur.execute(sel_sql, params)
-        jobs = cur.fetchall()
+        cur.execute(sel_sql)
+        all_jobs = cur.fetchall()
+    
+    # Filter jobs using same word boundary logic as main function
+    jobs = []
+    for job_id, source_name, title, description in all_jobs:
+        if not title:
+            continue
+        
+        t = title.lower()
+        
+        # Check include filter
+        if include_terms:
+            include_match = False
+            for term in include_terms:
+                pattern = r'\b' + re.escape(term) + r'\b'
+                if re.search(pattern, t):
+                    include_match = True
+                    break
+            if not include_match:
+                continue
+        
+        # Check exclude filter
+        if exclude_terms:
+            exclude_match = False
+            for term in exclude_terms:
+                pattern = r'\b' + re.escape(term) + r'\b'
+                if re.search(pattern, t):
+                    exclude_match = True
+                    break
+            if exclude_match:
+                continue
+        
+        jobs.append((job_id, source_name, title, description))
     
     # Extract skills and detect work location type for each job
     skills_map: Dict[Tuple[str, str], List[str]] = {}
@@ -625,6 +649,8 @@ def fetch_page(
     page: int,
     api_key: str,
     api_key_backup: Optional[str] = None,
+    api_key_backup_2: Optional[str] = None,
+    api_key_backup_3: Optional[str] = None,
     posted_by_days: Optional[int] = None
 ) -> Dict[str, Any]:
     """
@@ -633,23 +659,25 @@ def fetch_page(
     Supports pagination via resultsToTake/resultsToSkip parameters.
     Optionally filters to jobs posted within N days via postedByDays parameter
     (0 = all jobs, >0 = incremental mode).
-    
-    Falls back to backup API key on 403 Forbidden errors (rate limiting).
+
+    Falls back through 4 API keys on 403 Forbidden errors (rate limiting).
     
     Args:
         base_url: Reed API base URL (https://www.reed.co.uk/api/1.0/search)
         keywords: Search keyword string (comma-separated for multiple)
         results_per_page: Page size (typically 50)
         page: Page number (1-based)
-        api_key: Reed API authentication key
-        api_key_backup: Backup API key for rate limit fallback (optional)
+        api_key: Reed API authentication key (primary)
+        api_key_backup: First backup API key for rate limit fallback (optional)
+        api_key_backup_2: Second backup API key (optional)
+        api_key_backup_3: Third backup API key (optional)
         posted_by_days: Filter to jobs posted in last N days (optional)
         
     Returns:
         API response dict with 'results' and 'totalResults' keys
         
     Raises:
-        requests.HTTPError: On API request failure
+        requests.HTTPError: On API request failure (all keys exhausted)
     """
     params = {
         "keywords": keywords,
@@ -661,44 +689,103 @@ def fetch_page(
     if posted_by_days and posted_by_days > 0:
         params["postedByDays"] = posted_by_days
     
-    # Try primary API key first
-    try:
-        resp = requests.get(base_url, params=params, auth=(api_key, ""))
-        resp.raise_for_status()
-        return resp.json()
-    except requests.HTTPError as e:
-        # On 403 Forbidden (rate limit), try backup key if available
-        if e.response.status_code == 403 and api_key_backup:
-            print(f"⚠️ Primary API key rate limited (403); switching to backup key")
-            try:
-                resp = requests.get(base_url, params=params, auth=(api_key_backup, ""))
-                resp.raise_for_status()
-                return resp.json()
-            except Exception as backup_err:
-                print(f"⚠️ Backup API key also failed: {backup_err}")
-                raise e  # Re-raise original error
-        else:
-            raise
-    return resp.json()
+    # Try API keys in sequence: primary → backup → backup_2 → backup_3
+    api_keys = [api_key]
+    if api_key_backup:
+        api_keys.append(api_key_backup)
+    if api_key_backup_2:
+        api_keys.append(api_key_backup_2)
+    if api_key_backup_3:
+        api_keys.append(api_key_backup_3)
+    
+    for i, key in enumerate(api_keys):
+        try:
+            resp = requests.get(base_url, params=params, auth=(key, ""))
+            resp.raise_for_status()
+            return resp.json()
+        except requests.HTTPError as e:
+            if e.response.status_code == 403 and i < len(api_keys) - 1:
+                print(f"⚠️ API key {i+1} rate limited (403); trying backup key {i+2}...")
+                continue
+            elif i < len(api_keys) - 1:
+                print(f"⚠️ API key {i+1} failed ({e}); trying backup key {i+2}...")
+                continue
+            else:
+                raise
+        except Exception as e:
+            if i < len(api_keys) - 1:
+                print(f"⚠️ API key {i+1} error ({e}); trying backup key {i+2}...")
+                continue
+            else:
+                raise
+    
+    # Should never reach here
+    raise RuntimeError("No API keys available")
 
 
-def fetch_job_detail(api_base_url: str, job_id: str, api_key: str) -> Optional[Dict[str, Any]]:
+def fetch_job_detail(
+    api_base_url: str,
+    job_id: str,
+    api_key: str,
+    api_key_backup_1: Optional[str] = None,
+    api_key_backup_2: Optional[str] = None,
+    api_key_backup_3: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """
     Fetch full job details for a given job_id using Reed API.
     Tries the jobs endpoint inferred from API_BASE_URL.
+    Falls back through four API keys on failure (403 or other errors).
+    
+    Args:
+        api_base_url: Reed API base URL
+        job_id: Job ID to fetch details for
+        api_key: Primary API key
+        api_key_backup_1: First backup API key (optional)
+        api_key_backup_2: Second backup API key (optional)
+        api_key_backup_3: Third backup API key (optional)
+        
+    Returns:
+        Job detail dict or None if all API keys fail
     """
     # Infer jobs endpoint: replace trailing '/search' with '/jobs/{id}'
     jobs_url = api_base_url.rstrip('/')
     if jobs_url.endswith('/search'):
         jobs_url = jobs_url[:-len('/search')]
     jobs_url = f"{jobs_url}/jobs/{job_id}"
-    try:
-        r = requests.get(jobs_url, auth=(api_key, ""))
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"⚠️ Failed to fetch job detail for {job_id}: {e}")
-        return None
+    
+    # Try API keys in sequence: primary → backup_1 → backup_2 → backup_3
+    api_keys = [api_key]
+    if api_key_backup_1:
+        api_keys.append(api_key_backup_1)
+    if api_key_backup_2:
+        api_keys.append(api_key_backup_2)
+    if api_key_backup_3:
+        api_keys.append(api_key_backup_3)
+    
+    for i, key in enumerate(api_keys):
+        try:
+            r = requests.get(jobs_url, auth=(key, ""))
+            r.raise_for_status()
+            return r.json()
+        except requests.HTTPError as e:
+            if e.response.status_code == 403 and i < len(api_keys) - 1:
+                print(f"⚠️ API key {i+1} rate limited (403); trying backup key {i+2}...")
+                continue
+            elif i < len(api_keys) - 1:
+                print(f"⚠️ API key {i+1} failed ({e}); trying backup key {i+2}...")
+                continue
+            else:
+                print(f"⚠️ Failed to fetch job detail for {job_id} (all API keys exhausted): {e}")
+                return None
+        except Exception as e:
+            if i < len(api_keys) - 1:
+                print(f"⚠️ API key {i+1} error ({e}); trying backup key {i+2}...")
+                continue
+            else:
+                print(f"⚠️ Failed to fetch job detail for {job_id}: {e}")
+                return None
+    
+    return None
 
 
 def parse_iso(dt: Optional[str]) -> Optional[datetime]:
@@ -1481,13 +1568,16 @@ def main(mytimer: func.TimerRequest) -> None:
 
     # Load config & validate
     try:
+        print("⏳ [1/8] Loading configuration...")
         cfg = load_config()
+        print(f"✅ Config loaded: API_BASE_URL={cfg['API_BASE_URL']}, SEARCH_KEYWORDS={cfg['SEARCH_KEYWORDS']}")
     except Exception as e:
         print(f"❌ reed_ingest failed loading config: {e}")
         raise
 
     # Pull one page first to learn total count
     try:
+        print("⏳ [2/8] Fetching page 1 from Reed API...")
         first = fetch_page(
             cfg["API_BASE_URL"],
             cfg["SEARCH_KEYWORDS"],
@@ -1495,8 +1585,11 @@ def main(mytimer: func.TimerRequest) -> None:
             page=1,
             api_key=cfg["API_KEY"],
             api_key_backup=cfg.get("API_KEY_BACKUP"),
+            api_key_backup_2=cfg.get("API_KEY_BACKUP2"),
+            api_key_backup_3=cfg.get("API_KEY_BACKUP3"),
             posted_by_days=cfg["POSTED_BY_DAYS"],
         )
+        print("✅ Page 1 fetched successfully")
     except Exception as e:
         print(f"❌ API call (page 1) failed: {e}")
         raise
@@ -1508,6 +1601,7 @@ def main(mytimer: func.TimerRequest) -> None:
     total_results = first.get(total_key)
     if isinstance(total_results, str) and total_results.isdigit():
         total_results = int(total_results)
+    print(f"📊 Page 1: {len(results)} results, total pages estimate: {total_results}")
 
     if total_results is None:
         # Fallback: keep fetching until an empty page
@@ -1516,7 +1610,7 @@ def main(mytimer: func.TimerRequest) -> None:
         total_results = len(results)
 
     posted_filter = f" (posted in last {cfg['POSTED_BY_DAYS']} days)" if cfg["POSTED_BY_DAYS"] > 0 else " (all jobs)"
-    print(f"� fetched={len(results)} on page=1; totalResults={total_results}{posted_filter}")
+    print(f"⏳ [3/8] Pagination: fetched={len(results)} on page=1; totalResults={total_results}{posted_filter}")
 
     # If totalResults exists, calculate page count; else, fetch until empty.
     pages = (
@@ -1524,6 +1618,7 @@ def main(mytimer: func.TimerRequest) -> None:
         if isinstance(total_results, int) and total_results >= 0
         else 1
     )
+    print(f"📄 Will fetch approximately {pages} pages")
 
     if pages > 1:
         for p in range(2, pages + 1):
@@ -1539,6 +1634,8 @@ def main(mytimer: func.TimerRequest) -> None:
                     page=p,
                     api_key=cfg["API_KEY"],
                     api_key_backup=cfg.get("API_KEY_BACKUP"),
+                    api_key_backup_2=cfg.get("API_KEY_BACKUP2"),
+                    api_key_backup_3=cfg.get("API_KEY_BACKUP3"),
                     posted_by_days=cfg["POSTED_BY_DAYS"],
                 )
             except Exception as e:
@@ -1547,13 +1644,15 @@ def main(mytimer: func.TimerRequest) -> None:
 
             page_items = page_obj.get(results_key, []) or []
             if not page_items:
-                print(f"🔚 empty page at p={p}; stopping pagination.")
+                print(f"🔚 Empty page at p={p}; stopping pagination.")
                 break
 
             results.extend(page_items)
-            print(f"📥 fetched+={len(page_items)} (running total={len(results)})")
+            progress_pct = (len(results) / total_results * 100) if isinstance(total_results, int) else 0
+            print(f"  Page {p}: +{len(page_items)} items (total: {len(results)}, ~{progress_pct:.0f}%)")
 
     # Apply title-based include/exclude filtering
+    print(f"⏳ [4/8] Applying title filters...")
     def _title_of(j: Dict[str, Any]) -> str:
         return (j.get('jobTitle') or j.get('title') or "").lower()
     include_terms = cfg.get("JOB_TITLE_INCLUDE", [])
@@ -1589,9 +1688,10 @@ def main(mytimer: func.TimerRequest) -> None:
                 continue
         
         filtered_results.append(j)
-    print(f"🔎 title-filter: kept={len(filtered_results)} of {pre_filter_count} (include={include_terms} exclude={exclude_terms})")
+    print(f"✅ Title filter: kept {len(filtered_results):,} of {pre_filter_count:,} (include={include_terms}, exclude={exclude_terms})")
 
     # Apply expiration date filtering - exclude jobs that have already expired
+    print(f"⏳ [5/8] Checking job expiry dates...")
     pre_expiry_filter = len(filtered_results)
     now = datetime.now(timezone.utc)
     expiry_filtered_results = []
@@ -1606,20 +1706,24 @@ def main(mytimer: func.TimerRequest) -> None:
     
     expired_count = pre_expiry_filter - len(expiry_filtered_results)
     if expired_count > 0:
-        print(f"⏰ expiry-filter: removed={expired_count} expired jobs; kept={len(expiry_filtered_results)} of {pre_expiry_filter}")
+        print(f"✅ Expiry filter: removed {expired_count:,} expired jobs; {len(expiry_filtered_results):,} active")
+    else:
+        print(f"✅ Expiry filter: all {len(expiry_filtered_results):,} jobs are active")
     
     filtered_results = expiry_filtered_results
 
-    if not results:
-        print("ℹ️ No results returned; nothing to upsert.")
+    if not filtered_results:
+        print("ℹ️ No results after filtering; nothing to upsert.")
         return
 
     # Optionally enrich truncated descriptions and fetch additional detail fields
     # (contractType, fullTime, partTime, salaryType only available in detail endpoint)
+    print(f"⏳ [6/8] Enriching job descriptions via detail endpoint...")
     enriched = []
     enriched_count = 0
     not_enriched_count = 0
-    for j in filtered_results:
+    skipped_count = 0
+    for i, j in enumerate(filtered_results, 1):
         job_id_str = str(j.get(cfg['JOB_ID_KEY']))
         desc = (j.get('jobDescription') or '').strip()
         # Reed API truncates descriptions at various lengths; detect multiple truncation patterns:
@@ -1643,12 +1747,20 @@ def main(mytimer: func.TimerRequest) -> None:
         # 2. We're missing detail-only fields (contractType, fullTime, partTime, salaryType)
         needs_detail = is_truncated or not j.get('contractType')
         
-        if needs_detail and cfg.get('API_BASE_URL'):
+        # Skip enrichment if explicitly disabled or if API appears rate-limited
+        skip_enrichment = cfg.get('SKIP_ENRICHMENT', False)
+        
+        if needs_detail and cfg.get('API_BASE_URL') and not skip_enrichment:
             try:
-                # Try primary API key first, fall back to backup if 403
-                full = fetch_job_detail(cfg['API_BASE_URL'], job_id_str, cfg['API_KEY'])
-                if not full and cfg.get('API_KEY_BACKUP'):
-                    full = fetch_job_detail(cfg['API_BASE_URL'], job_id_str, cfg['API_KEY_BACKUP'])
+                # Fetch with 4-tier API key fallback chain
+                full = fetch_job_detail(
+                    cfg['API_BASE_URL'],
+                    job_id_str,
+                    cfg['API_KEY'],
+                    api_key_backup_1=cfg.get('API_KEY_BACKUP'),
+                    api_key_backup_2=cfg.get('API_KEY_BACKUP2'),
+                    api_key_backup_3=cfg.get('API_KEY_BACKUP3')
+                )
                 
                 if full:
                     # Always merge detail-only fields (contractType, fullTime, partTime, salaryType)
@@ -1664,18 +1776,22 @@ def main(mytimer: func.TimerRequest) -> None:
                             j['jobDescription'] = full_desc
                     
                     enriched_count += 1
+                    if i % 50 == 0:
+                        print(f"  Enriched {enriched_count}/{i} jobs...")
                 else:
                     not_enriched_count += 1
+
             except Exception as e:
                 print(f"⚠️ Failed to enrich job {job_id_str}: {e}")
                 not_enriched_count += 1
         enriched.append(j)
-    print(f"✨ Enriched {enriched_count} job descriptions; {not_enriched_count} could not be enriched")
+    print(f"✅ Enrichment complete: {enriched_count:,} descriptions updated, {not_enriched_count} failed")
 
     # Prepare rows
+    print(f"⏳ [7/8] Preparing data for database...")
     try:
         rows = [shape_row(cfg, j) for j in enriched if cfg["JOB_ID_KEY"] in j]
-        print(f"🧾 prepared rows={len(rows)} (with job_id present)")
+        print(f"  Shaped {len(rows):,} rows")
         
         # Deduplicate by (source_name, job_id) - keep last occurrence
         # Row structure: (source_name, job_id, title, employer, location, posted_at, expires_at, date_modified, raw, content_hash)
@@ -1685,7 +1801,7 @@ def main(mytimer: func.TimerRequest) -> None:
             unique_rows[key] = row
         
         rows = list(unique_rows.values())
-        print(f"🔑 unique rows={len(rows)} (after deduplication)")
+        print(f"  Deduplicated to {len(rows):,} unique jobs")
     except Exception as e:
         print(f"❌ Failed shaping rows: {e}")
         raise
@@ -1695,17 +1811,21 @@ def main(mytimer: func.TimerRequest) -> None:
         return
 
     # DB work
+    print(f"⏳ [8/8] Writing to database...")
     try:
         with pg_connect(cfg) as conn:
+            print("  Ensuring tables exist...")
             ensure_landing_table(conn)
             ensure_staging_table(conn)
             ensure_job_skills_table(conn)
             
             # Upsert enriched jobs to landing - descriptions should be in the raw JSON now
+            print(f"  Upserting {len(rows):,} jobs to landing.raw_jobs...")
             upsert_jobs(conn, rows)
             if enriched_count > 0:
-                print(f"💾 Persisted {enriched_count} enriched descriptions via upsert")
+                print(f"    ✅ {enriched_count:,} descriptions enriched")
             
+            print(f"  Transforming and upserting to staging.jobs_v1...")
             staging_count = upsert_staging_jobs(
                 conn,
                 cfg["SKILL_PATTERNS"],
@@ -1714,17 +1834,26 @@ def main(mytimer: func.TimerRequest) -> None:
                 cfg.get("JOB_TITLE_EXCLUDE", []),
                 cfg.get("JOB_ROLE_CATEGORIES", JOB_ROLE_CATEGORIES)
             )
-            print(f"📦 Staging: upserted {staging_count} rows into staging.jobs_v1")
+            print(f"    ✅ Upserted {staging_count:,} rows into staging.jobs_v1")
             
-            # Run cleanup for expired jobs
+            print(f"  Running cleanup for expired jobs...")
             cleanup_expired_jobs(conn, cfg)
+            print(f"    ✅ Cleanup complete")
             
             # Log enrichment and skill extraction statistics
             if cfg.get("ENABLE_ENRICHMENT_MONITORING", True):
+                print(f"  Logging enrichment statistics...")
                 log_enrichment_stats(conn)
                 log_skill_extraction_stats(conn)
     except Exception as e:
         print(f"❌ Database step failed: {e}")
         raise
 
-    print(f"✅ Upsert complete. committed={len(rows)} rows from source={cfg['SOURCE_NAME']}")
+    completed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"\n✅ PIPELINE COMPLETE at {completed_at}")
+    print(f"   Fetched: {len(results):,} total results from API")
+    print(f"   Filtered: {len(filtered_results):,} after title/expiry filters")
+    print(f"   Enriched: {enriched_count:,} descriptions via detail endpoint")
+    print(f"   Upserted: {len(rows):,} rows to landing.raw_jobs")
+    print(f"   Staged: {staging_count:,} rows to staging.jobs_v1")
+    print(f"   Duration: {(datetime.now(timezone.utc) - datetime.fromisoformat(fired_at)).total_seconds():.0f}s\n")
