@@ -283,6 +283,10 @@ def ensure_staging_table(conn):
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         work_location_type TEXT,
         seniority_level TEXT,
+        contract_type   TEXT,
+        full_time       BOOLEAN,
+        part_time       BOOLEAN,
+        salary_type     TEXT,
         UNIQUE (source_name, job_id)
     );
     """
@@ -291,6 +295,10 @@ def ensure_staging_table(conn):
         # Ensure columns exist if table was created previously
         cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS work_location_type TEXT;")
         cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS seniority_level TEXT;")
+        cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS contract_type TEXT;")
+        cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS full_time BOOLEAN;")
+        cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS part_time BOOLEAN;")
+        cur.execute("ALTER TABLE staging.jobs_v1 ADD COLUMN IF NOT EXISTS salary_type TEXT;")
     conn.commit()
 
 
@@ -468,8 +476,9 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
                 INSERT INTO staging.jobs_v1 (
                     source_name, job_id, job_title, employer_name, employer_id,
                     location_name, salary_min, salary_max, job_url,
-                    applications, job_description, work_location_type, seniority_level, posted_at, expires_at,
-                    ingested_at, updated_at
+                    applications, job_description, work_location_type, seniority_level,
+                    contract_type, full_time, part_time, salary_type,
+                    posted_at, expires_at, ingested_at, updated_at
                 )
                 SELECT 
                     source_name,
@@ -485,6 +494,10 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
                     raw->>'jobDescription' as job_description,
                     %s as work_location_type,
                     %s as seniority_level,
+                    raw->>'contractType' as contract_type,
+                    (raw->>'fullTime')::boolean as full_time,
+                    (raw->>'partTime')::boolean as part_time,
+                    raw->>'salaryType' as salary_type,
                     posted_at,
                     expires_at,
                     ingested_at,
@@ -503,6 +516,10 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
                     job_description = EXCLUDED.job_description,
                     work_location_type = EXCLUDED.work_location_type,
                     seniority_level = EXCLUDED.seniority_level,
+                    contract_type = EXCLUDED.contract_type,
+                    full_time = EXCLUDED.full_time,
+                    part_time = EXCLUDED.part_time,
+                    salary_type = EXCLUDED.salary_type,
                     posted_at = EXCLUDED.posted_at,
                     expires_at = EXCLUDED.expires_at,
                     updated_at = NOW();
@@ -1352,7 +1369,8 @@ def main(mytimer: func.TimerRequest) -> None:
         print("ℹ️ No results returned; nothing to upsert.")
         return
 
-    # Optionally enrich truncated descriptions by fetching job detail
+    # Optionally enrich truncated descriptions and fetch additional detail fields
+    # (contractType, fullTime, partTime, salaryType only available in detail endpoint)
     enriched = []
     enriched_count = 0
     not_enriched_count = 0
@@ -1370,19 +1388,28 @@ def main(mytimer: func.TimerRequest) -> None:
         ]
         is_truncated = len(desc) < 200 or any(re.search(p, desc.lower()) for p in truncation_patterns)
         
-        if is_truncated and cfg.get('API_BASE_URL'):
+        # Fetch detail endpoint if:
+        # 1. Description is truncated, OR
+        # 2. We're missing detail-only fields (contractType, fullTime, partTime, salaryType)
+        needs_detail = is_truncated or not j.get('contractType')
+        
+        if needs_detail and cfg.get('API_BASE_URL'):
             try:
                 full = fetch_job_detail(cfg['API_BASE_URL'], job_id_str, cfg['API_KEY'])
-                if full and full.get('jobDescription'):
-                    full_desc = full.get('jobDescription', '').strip()
-                    if len(full_desc) > len(desc):
-                        j['jobDescription'] = full_desc
-                        enriched_count += 1
-                        # Verify the update actually happened
-                        if j.get('jobDescription') != full_desc:
-                            print(f"⚠️ ERROR: Failed to update job {job_id_str} description in-memory")
-                    else:
-                        not_enriched_count += 1
+                if full:
+                    # Always merge detail-only fields (contractType, fullTime, partTime, salaryType)
+                    j['contractType'] = full.get('contractType')
+                    j['fullTime'] = full.get('fullTime')
+                    j['partTime'] = full.get('partTime')
+                    j['salaryType'] = full.get('salaryType')
+                    
+                    # Update description if detail has longer version
+                    if full.get('jobDescription'):
+                        full_desc = full.get('jobDescription', '').strip()
+                        if len(full_desc) > len(desc):
+                            j['jobDescription'] = full_desc
+                    
+                    enriched_count += 1
                 else:
                     not_enriched_count += 1
             except Exception as e:
