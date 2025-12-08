@@ -28,6 +28,13 @@ Last Updated: 2025-12-04
 """
 
 import os
+import sys
+import re
+from pathlib import Path
+
+# Add current directory to path to import job_classifier
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 import json
 import math
 import hashlib
@@ -39,6 +46,14 @@ import azure.functions as func
 import requests
 import psycopg2
 import psycopg2.extras
+
+# Import ML classifier
+try:
+    from job_classifier import JobClassifier
+    ML_CLASSIFIER_AVAILABLE = True
+except ImportError:
+    ML_CLASSIFIER_AVAILABLE = False
+    print("⚠️  ML classifier not available - will use rule-based filtering only")
 
 
 # ---------- Skills extraction patterns ----------
@@ -242,6 +257,10 @@ def load_config() -> Dict[str, Any]:
     else:
         cfg["JOB_ROLE_CATEGORIES"] = JOB_ROLE_CATEGORIES
 
+    # ML Classifier settings
+    cfg["USE_ML_CLASSIFIER"] = os.getenv("USE_ML_CLASSIFIER", "false").lower() == "true"
+    cfg["ML_CLASSIFIER_THRESHOLD"] = float(os.getenv("ML_CLASSIFIER_THRESHOLD", "0.7"))
+
     return cfg
 
 
@@ -395,17 +414,36 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
     
     # Fetch all jobs from landing that have descriptions
     sel_sql = """
-        SELECT job_id, source_name, raw->>'jobTitle' as title, raw->>'jobDescription' as description
+        SELECT job_id, source_name, raw->>'jobTitle' as title, raw->>'jobDescription' as description, raw->>'locationName' as location_name
         FROM landing.raw_jobs
         WHERE raw->>'jobDescription' IS NOT NULL AND raw->>'jobTitle' IS NOT NULL
     """
     with conn.cursor() as cur:
         cur.execute(sel_sql)
-        all_jobs = cur.fetchall()
+        all_jobs_raw = cur.fetchall()
+    
+    # Standardize locations and add to jobs tuple
+    all_jobs = []
+    location_standardization_map = {}  # Cache for location standardization
+    for job_id, source_name, title, description, raw_location in all_jobs_raw:
+        # Standardize location if not already cached
+        if raw_location:
+            if raw_location not in location_standardization_map:
+                location_standardization_map[raw_location] = standardize_location(raw_location)
+            standardized_location = location_standardization_map[raw_location]
+        else:
+            standardized_location = None
+        
+        all_jobs.append((job_id, source_name, title, description, standardized_location))
+    
+    # Store standardized locations for later use
+    standardized_location_map = {}  # (source_name, job_id) -> standardized_location
+    for job_id, source_name, title, description, std_location in all_jobs:
+        standardized_location_map[(source_name, job_id)] = std_location
     
     # Filter jobs using same word boundary logic as main function
     jobs = []
-    for job_id, source_name, title, description in all_jobs:
+    for job_id, source_name, title, description, std_location in all_jobs:
         if not title:
             continue
         
@@ -433,7 +471,7 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
             if exclude_match:
                 continue
         
-        jobs.append((job_id, source_name, title, description))
+        jobs.append((job_id, source_name, title, description, std_location))
     
     # Extract skills and detect work location type for each job
     skills_map: Dict[Tuple[str, str], List[str]] = {}
@@ -443,6 +481,7 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
     salary_fallback_map: Dict[Tuple[str, str], Tuple[Optional[float], Optional[float]]] = {}
     salary_type_map: Dict[Tuple[str, str], Optional[str]] = {}
     employment_map: Dict[Tuple[str, str], Tuple[Optional[bool], Optional[bool], Optional[str]]] = {}
+    location_name_map: Dict[Tuple[str, str], str] = {}  # For standardized city names
     # rows of (source_name, job_id, category, canonical)
     job_skill_pairs: List[Tuple[str, str, str, str]] = []
     # Build reverse map pattern -> category for fast lookup
@@ -455,7 +494,7 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
     if job_role_categories is None:
         job_role_categories = JOB_ROLE_CATEGORIES
     
-    for job_id, source_name, title, description in jobs:
+    for job_id, source_name, title, description, std_location in jobs:
         # Extract skills using the updated extract_skills function (min length filter applied there)
         canonical_skills = extract_skills(description, skill_patterns, skill_aliases)
         skills_map[(source_name, job_id)] = canonical_skills
@@ -475,6 +514,8 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
         salary_type_map[(source_name, job_id)] = salary_type_inferred
         # Detect employment terms (full/part time, contract type)
         employment_map[(source_name, job_id)] = detect_employment_terms(title, description)
+        # Store standardized location (already standardized during fetch)
+        standardized_location_map[(source_name, job_id)] = std_location
         # Accumulate job-skill rows (source_name, job_id, category, skill)
         for canonical in canonical_skills:
             cat = pattern_category.get(canonical)
@@ -530,15 +571,57 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
         updated_at = NOW();
     """
     
-    # Convert skills_map to PostgreSQL array format for bulk insert
-    # This is a simplified approach - in production, you'd do this more efficiently
-    with conn.cursor() as cur:
-        # For now, we'll update each row individually with its skills
-        # A more efficient approach would be to use a temp table or UNNEST
-        for (source_name, job_id), skills in skills_map.items():
-            location_type = location_map.get((source_name, job_id), 'unknown')
-            seniority = seniority_map.get((source_name, job_id), 'mid')
-            role_category = role_category_map.get((source_name, job_id))
+    # Bulk insert into staging.jobs_v1 using a single atomic operation
+    # Build a temp table with all job data, then upsert in one go
+    row_count = len(skills_map)
+    
+    if row_count > 0:
+        with conn.cursor() as cur:
+            # Create a temporary table for bulk insert
+            cur.execute("""
+                CREATE TEMP TABLE staging_jobs_temp (
+                    source_name text,
+                    job_id text,
+                    salary_min numeric,
+                    salary_max numeric,
+                    work_location_type text,
+                    seniority_level text,
+                    job_role_category text,
+                    contract_type text,
+                    full_time boolean,
+                    part_time boolean,
+                    salary_type text,
+                    standardized_location_name text
+                ) ON COMMIT DROP
+            """)
+            
+            # Prepare bulk data for temp table
+            temp_data = []
+            for (source_name, job_id), skills in skills_map.items():
+                location_type = location_map.get((source_name, job_id), 'unknown')
+                seniority = seniority_map.get((source_name, job_id), 'mid')
+                role_category = role_category_map.get((source_name, job_id))
+                salary_min, salary_max = salary_fallback_map.get((source_name, job_id), (None, None))
+                full_time, part_time, contract = employment_map.get((source_name, job_id), (None, None, None))
+                salary_type = salary_type_map.get((source_name, job_id))
+                std_location = standardized_location_map.get((source_name, job_id))
+                
+                temp_data.append((
+                    source_name, job_id, salary_min, salary_max,
+                    location_type, seniority, role_category,
+                    contract, full_time, part_time, salary_type, std_location
+                ))
+            
+            # Bulk insert into temp table
+            from psycopg2.extras import execute_values
+            execute_values(cur, """
+                INSERT INTO staging_jobs_temp 
+                (source_name, job_id, salary_min, salary_max, work_location_type,
+                 seniority_level, job_role_category, contract_type, full_time, part_time, salary_type, standardized_location_name)
+                VALUES %s
+            """, temp_data, page_size=1000)
+            
+            # Single atomic upsert from temp table to jobs_v1
             cur.execute("""
                 INSERT INTO staging.jobs_v1 (
                     source_name, job_id, job_title, employer_name, employer_id,
@@ -548,30 +631,30 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
                     posted_at, expires_at, ingested_at, updated_at
                 )
                 SELECT 
-                    source_name,
-                    job_id,
-                    raw->>'jobTitle' as job_title,
-                    raw->>'employerName' as employer_name,
-                    (raw->>'employerId')::bigint as employer_id,
-                    raw->>'locationName' as location_name,
-                    COALESCE((raw->>'minimumSalary')::numeric, %s) as salary_min,
-                    COALESCE((raw->>'maximumSalary')::numeric, %s) as salary_max,
-                    raw->>'jobUrl' as job_url,
-                    (raw->>'applications')::int as applications,
-                    raw->>'jobDescription' as job_description,
-                    %s as work_location_type,
-                    %s as seniority_level,
-                    %s as job_role_category,
-                    COALESCE(raw->>'contractType', %s) as contract_type,
-                    COALESCE((raw->>'fullTime')::boolean, %s) as full_time,
-                    COALESCE((raw->>'partTime')::boolean, %s) as part_time,
-                    COALESCE(raw->>'salaryType', %s) as salary_type,
-                    posted_at,
-                    expires_at,
-                    ingested_at,
+                    r.source_name,
+                    r.job_id,
+                    r.raw->>'jobTitle' as job_title,
+                    r.raw->>'employerName' as employer_name,
+                    (r.raw->>'employerId')::bigint as employer_id,
+                    COALESCE(t.standardized_location_name, r.raw->>'locationName') as location_name,
+                    COALESCE((r.raw->>'minimumSalary')::numeric, t.salary_min) as salary_min,
+                    COALESCE((r.raw->>'maximumSalary')::numeric, t.salary_max) as salary_max,
+                    r.raw->>'jobUrl' as job_url,
+                    (r.raw->>'applications')::int as applications,
+                    r.raw->>'jobDescription' as job_description,
+                    t.work_location_type,
+                    t.seniority_level,
+                    t.job_role_category,
+                    COALESCE(t.contract_type, r.raw->>'contractType', 'permanent') as contract_type,
+                    COALESCE(t.full_time, (r.raw->>'fullTime')::boolean, false) as full_time,
+                    COALESCE(t.part_time, (r.raw->>'partTime')::boolean, false) as part_time,
+                    t.salary_type,
+                    r.posted_at,
+                    r.expires_at,
+                    r.ingested_at,
                     NOW() as updated_at
-                FROM landing.raw_jobs
-                WHERE source_name = %s AND job_id = %s
+                FROM landing.raw_jobs r
+                INNER JOIN staging_jobs_temp t ON (r.source_name = t.source_name AND r.job_id = t.job_id)
                 ON CONFLICT (source_name, job_id) DO UPDATE SET
                     job_title = EXCLUDED.job_title,
                     employer_name = EXCLUDED.employer_name,
@@ -591,22 +674,8 @@ def upsert_staging_jobs(conn, skill_patterns: set = None, skill_aliases: dict = 
                     salary_type = EXCLUDED.salary_type,
                     posted_at = EXCLUDED.posted_at,
                     expires_at = EXCLUDED.expires_at,
-                    updated_at = NOW();
-            """, (
-                salary_fallback_map.get((source_name, job_id), (None, None))[0],
-                salary_fallback_map.get((source_name, job_id), (None, None))[1],
-                location_type,
-                seniority,
-                role_category,
-                employment_map.get((source_name, job_id), (None, None, None))[2],
-                employment_map.get((source_name, job_id), (None, None, None))[0],
-                employment_map.get((source_name, job_id), (None, None, None))[1],
-                salary_type_map.get((source_name, job_id)),
-                source_name,
-                job_id,
-            ))
-        
-        row_count = len(skills_map)
+                    updated_at = NOW()
+            """)
     
     # Upsert job_skills mapping table in bulk (category, canonical skill, matched pattern)
     if job_skill_pairs:
@@ -815,6 +884,10 @@ def parse_salary_from_text(description: str) -> Tuple[Optional[float], Optional[
     if not description:
         return None, None, None
 
+    # Decode HTML entities (e.g., &#163; -> £)
+    import html
+    description = html.unescape(description)
+    
     text = description.lower()
     currency = 'GBP' if '£' in description or 'gbp' in text or 'per annum' in text else None
 
@@ -826,11 +899,16 @@ def parse_salary_from_text(description: str) -> Tuple[Optional[float], Optional[
         except Exception:
             return None
 
-    # Patterns to capture ranges
+    # Patterns to capture ranges - prioritize salary context
     range_patterns = [
-        r"£?\s?(?P<min>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<min_k>k)?\s*(?:to|-|–|—)\s*£?\s?(?P<max>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<max_k>k)?",
-        r"between\s+£?\s?(?P<min>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<min_k>k)?\s+and\s+£?\s?(?P<max>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<max_k>k)?",
-        r"from\s+£?\s?(?P<min>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<min_k>k)?\s+(?:to|up to)\s+£?\s?(?P<max>\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(?P<max_k>k)?",
+        # Explicit salary markers with ranges
+        r"(?:salary|compensation|package|pay|remuneration)[\s:]*(?:circa|approx\.?|approximately)?\s*£?\s?(?P<min>\d{1,3}(?:[, ]\d{3})+|\d+)(?P<min_k>k)?\s*(?:to|-|–|—)\s*£?\s?(?P<max>\d{1,3}(?:[, ]\d{3})+|\d+)(?P<max_k>k)?",
+        # Standard range with currency symbol
+        r"£\s?(?P<min>\d{1,3}(?:[, ]\d{3})+|\d+)(?P<min_k>k)?\s*(?:to|-|–|—)\s*£?\s?(?P<max>\d{1,3}(?:[, ]\d{3})+|\d+)(?P<max_k>k)?",
+        # Between X and Y format
+        r"between\s+£?\s?(?P<min>\d{1,3}(?:[, ]\d{3})+|\d+)(?P<min_k>k)?\s+and\s+£?\s?(?P<max>\d{1,3}(?:[, ]\d{3})+|\d+)(?P<max_k>k)?",
+        # From X to Y format
+        r"from\s+£?\s?(?P<min>\d{1,3}(?:[, ]\d{3})+|\d+)(?P<min_k>k)?\s+(?:to|up to)\s+£?\s?(?P<max>\d{1,3}(?:[, ]\d{3})+|\d+)(?P<max_k>k)?",
     ]
 
     for pat in range_patterns:
@@ -854,12 +932,13 @@ def parse_salary_from_text(description: str) -> Tuple[Optional[float], Optional[
         if min_val is not None:
             return min_val, min_val, currency
 
-    # Fallback: grab first two numeric tokens (supports k suffix)
-    number_pattern = re.compile(r"£?\s?(\d{1,3}(?:[ ,]\d{3})?|\d+(?:\.\d+)?)(k)?")
+    # Fallback: grab salary-like numbers (filter out small values like "2-3 days")
+    # Only consider numbers that look like salaries (>= 10k or >= 10000)
+    number_pattern = re.compile(r"£\s?(\d{1,3}(?:[, ]\d{3})+|\d+)(k)?")
     numbers = []
     for n, kflag in number_pattern.findall(description):
         val = _to_number(n, bool(kflag))
-        if val is not None:
+        if val is not None and (val >= 10000 or (val >= 10 and kflag)):
             numbers.append(val)
 
     if not numbers:
@@ -897,6 +976,102 @@ def detect_salary_type(title: str, description: str) -> Optional[str]:
     if any(tok in text for tok in hour_tokens):
         return 'per hour'
     return None
+
+
+def standardize_location(location_name: str) -> str:
+    """
+    Standardize location names by converting UK postcodes to city names.
+    
+    Maintains city names as-is, converts postcodes to their district/city names.
+    Handles common UK postcode prefixes and remote variations.
+    
+    Args:
+        location_name: Raw location string (can be city name or postcode)
+        
+    Returns:
+        Standardized city/district name
+        
+    Examples:
+        'B111AD' → 'Birmingham'
+        'SW1A1AA' → 'London'
+        'London' → 'London'
+        'Remote' → 'Remote/Flexible'
+    """
+    if not location_name:
+        return location_name
+    
+    loc_clean = location_name.strip()
+    loc_upper = loc_clean.upper()
+    
+    # Handle remote/flexible work
+    if any(term in loc_upper for term in ['REMOTE', 'WORK FROM HOME', 'WFH', 'HYBRID', 'FLEXIBLE']):
+        return 'Remote/Flexible'
+    
+    # Mapping of UK postcode prefixes to city names
+    postcode_map = {
+        'AL': 'Aldershot', 'B1': 'Birmingham', 'B2': 'Birmingham', 'B3': 'Birmingham', 'B4': 'Birmingham',
+        'B5': 'Birmingham', 'B6': 'Birmingham', 'B7': 'Birmingham', 'B8': 'Birmingham',
+        'B9': 'Birmingham', 'B10': 'Birmingham', 'B11': 'Birmingham', 'B12': 'Birmingham',
+        'B13': 'Birmingham', 'B14': 'Birmingham', 'B15': 'Birmingham', 'B16': 'Birmingham',
+        'B17': 'Birmingham', 'B18': 'Birmingham', 'B19': 'Birmingham', 'B20': 'Birmingham',
+        'B21': 'Birmingham', 'B22': 'Birmingham', 'B23': 'Birmingham', 'B24': 'Birmingham',
+        'B25': 'Birmingham', 'B26': 'Birmingham', 'B27': 'Birmingham', 'B28': 'Birmingham',
+        'B29': 'Birmingham', 'B30': 'Birmingham', 'B31': 'Birmingham', 'B32': 'Birmingham',
+        'B33': 'Birmingham', 'B34': 'Birmingham', 'B35': 'Birmingham', 'B36': 'Birmingham',
+        'B37': 'Birmingham', 'B38': 'Birmingham', 'B39': 'Birmingham', 'B40': 'Birmingham',
+        'B41': 'Birmingham', 'B42': 'Birmingham', 'B43': 'Birmingham', 'B44': 'Birmingham',
+        'B45': 'Birmingham', 'B46': 'Birmingham', 'B47': 'Birmingham', 'B48': 'Birmingham',
+        'B49': 'Birmingham', 'BA': 'Bath', 'BB': 'Blackburn', 'BD': 'Bradford',
+        'BH': 'Bournemouth', 'BL': 'Bolton', 'BN': 'Brighton', 'BR': 'Bromley',
+        'BS': 'Bristol', 'BT': 'Belfast', 'CA': 'Carlisle', 'CB': 'Cambridge',
+        'CF': 'Cardiff', 'CH': 'Chester', 'CM': 'Chelmsford', 'CO': 'Colchester',
+        'CR': 'Croydon', 'CT': 'Canterbury', 'CV': 'Coventry', 'CW': 'Crewe',
+        'DA': 'Dartford', 'DD': 'Dundee', 'DE': 'Derby', 'DG': 'Dumfries',
+        'DH': 'Sunderland', 'DL': 'Darlington', 'DN': 'Doncaster', 'DT': 'Dorchester',
+        'DY': 'Dudley', 'E': 'London', 'EC': 'London', 'ED': 'Edinburgh',
+        'EH': 'Edinburgh', 'EN': 'Enfield', 'EX': 'Exeter', 'FK': 'Falkirk',
+        'FY': 'Fylde', 'G': 'Glasgow', 'GL': 'Gloucester', 'GU': 'Guildford',
+        'HA': 'Harrow', 'HD': 'Huddersfield', 'HG': 'Harrogate', 'HP': 'Hemel Hempstead',
+        'HR': 'Hereford', 'HS': 'Hebrides', 'HU': 'Hull', 'HX': 'Halifax',
+        'IG': 'Ilford', 'IP': 'Ipswich', 'IV': 'Inverness', 'JE': 'Jersey',
+        'KA': 'Kilmarnock', 'KT': 'Kingston', 'KY': 'Kirkcaldy', 'L': 'Liverpool',
+        'LA': 'Lancaster', 'LD': 'Llandrindod Wells', 'LE': 'Leicester', 'LN': 'Lincoln',
+        'LS': 'Leeds', 'LU': 'Luton', 'M': 'Manchester', 'ME': 'Medway',
+        'MK': 'Milton Keynes', 'ML': 'Motherwell', 'N': 'London', 'NE': 'Newcastle',
+        'NG': 'Nottingham', 'NN': 'Northampton', 'NP': 'Newport', 'NR': 'Norwich',
+        'NW': 'London', 'OL': 'Oldham', 'OX': 'Oxford', 'PA': 'Paisley',
+        'PE': 'Peterborough', 'PH': 'Perth', 'PL': 'Plymouth', 'PN': 'Penrith',
+        'PO': 'Portsmouth', 'PR': 'Preston', 'RG': 'Reading', 'RH': 'Redhill',
+        'RM': 'Romford', 'S': 'Sheffield', 'SA': 'Swansea', 'SE': 'London',
+        'SG': 'Stevenage', 'SK': 'Stockport', 'SL': 'Slough', 'SM': 'Sutton',
+        'SN': 'Swindon', 'SO': 'Southampton', 'SP': 'Salisbury', 'SR': 'Sunderland',
+        'SS': 'Southend', 'ST': 'Stoke-on-Trent', 'SW': 'London', 'SY': 'Shrewsbury',
+        'TA': 'Taunton', 'TD': 'Galashiels', 'TF': 'Telford', 'TN': 'Tonbridge',
+        'TR': 'Truro', 'TS': 'Middlesbrough', 'TW': 'Twickenham', 'TY': 'Tywyn',
+        'UB': 'Uxbridge', 'UL': 'Ullapool', 'W': 'London', 'WA': 'Warrington',
+        'WC': 'London', 'WD': 'Watford', 'WF': 'Wakefield', 'WN': 'Wigan',
+        'WR': 'Worcester', 'WS': 'Walsall', 'WV': 'Wolverhampton', 'YO': 'York', 'ZE': 'Shetland',
+    }
+    
+    # Detect if this looks like a postcode vs a city name
+    # Postcodes have: letter-letter pattern, contain digits, and have 6-7 chars
+    # City names typically have: no digits, or are already formatted as city names
+    is_likely_postcode = (
+        len(loc_upper) >= 5 and 
+        len(loc_upper) <= 8 and
+        any(c.isdigit() for c in loc_upper) and
+        any(c.isalpha() for c in loc_upper)
+    )
+    
+    # Only try postcode mapping if it looks like a postcode
+    if is_likely_postcode:
+        # Try to match against postcode map (longer prefixes first)
+        for prefix in sorted(postcode_map.keys(), key=len, reverse=True):
+            if loc_upper.startswith(prefix):
+                return postcode_map[prefix]
+    
+    # Return as-is (preserve original formatting for city names)
+    return loc_clean
 
 
 def detect_employment_terms(title: str, description: str) -> Tuple[Optional[bool], Optional[bool], Optional[str]]:
@@ -1560,6 +1735,269 @@ def log_skill_extraction_stats(conn) -> None:
         print(f"⚠️ Monitoring warning: Failed to log skill stats: {e}")
 
 
+def detect_and_report_duplicates(conn) -> None:
+    """
+    Comprehensive duplicate detection across all data layers
+    Checks landing, staging, and junction tables for duplicate rows
+    Reports findings and suggests cleanup if needed
+    """
+    try:
+        with conn.cursor() as cur:
+            print(f"\n🔍 Duplicate Detection Report:")
+            
+            # Check 1: Landing layer duplicates
+            cur.execute("""
+                SELECT source_name, job_id, COUNT(*) as dup_count
+                FROM landing.raw_jobs
+                GROUP BY source_name, job_id
+                HAVING COUNT(*) > 1
+                ORDER BY dup_count DESC
+            """)
+            landing_dups = cur.fetchall()
+            
+            if landing_dups:
+                total_landing_dups = sum(count - 1 for _, _, count in landing_dups)
+                print(f"   ⚠️  landing.raw_jobs: {len(landing_dups)} duplicate combinations, {total_landing_dups} extra rows")
+                for source, job_id, count in landing_dups[:3]:
+                    print(f"      {source}/{job_id}: {count} copies")
+            else:
+                print(f"   ✅ landing.raw_jobs: No duplicates")
+            
+            # Check 2: Staging jobs duplicates
+            cur.execute("""
+                SELECT source_name, job_id, COUNT(*) as dup_count
+                FROM staging.jobs_v1
+                GROUP BY source_name, job_id
+                HAVING COUNT(*) > 1
+                ORDER BY dup_count DESC
+            """)
+            staging_dups = cur.fetchall()
+            
+            if staging_dups:
+                total_staging_dups = sum(count - 1 for _, _, count in staging_dups)
+                print(f"   ⚠️  staging.jobs_v1: {len(staging_dups)} duplicate combinations, {total_staging_dups} extra rows")
+                for source, job_id, count in staging_dups[:3]:
+                    print(f"      {source}/{job_id}: {count} copies")
+            else:
+                print(f"   ✅ staging.jobs_v1: No duplicates")
+            
+            # Check 3: Job skills duplicates (junction table integrity)
+            cur.execute("""
+                SELECT source_name, job_id, skill, COUNT(*) as dup_count
+                FROM staging.job_skills
+                GROUP BY source_name, job_id, skill
+                HAVING COUNT(*) > 1
+                ORDER BY dup_count DESC
+            """)
+            skills_dups = cur.fetchall()
+            
+            if skills_dups:
+                total_skill_dups = sum(count - 1 for _, _, _, count in skills_dups)
+                print(f"   ⚠️  staging.job_skills: {len(skills_dups)} duplicate job-skill pairs, {total_skill_dups} extra rows")
+                for source, job_id, skill, count in skills_dups[:3]:
+                    print(f"      {source}/{job_id}/{skill}: {count} times")
+            else:
+                print(f"   ✅ staging.job_skills: No duplicates")
+            
+            # Check 4: Dimension table consistency
+            cur.execute("""
+                SELECT COUNT(DISTINCT employer_id) as unique_in_jobs,
+                       (SELECT COUNT(DISTINCT employer_id) FROM staging.dim_employer) as dim_count
+                FROM staging.jobs_v1
+                WHERE employer_id IS NOT NULL
+            """)
+            jobs_unique, dim_count = cur.fetchone()
+            if jobs_unique == dim_count:
+                print(f"   ✅ dim_employer consistency: {jobs_unique} unique employers")
+            else:
+                print(f"   ⚠️  dim_employer mismatch: {jobs_unique} unique vs {dim_count} in dimension")
+            
+            # Overall status
+            if landing_dups or staging_dups or skills_dups:
+                print(f"\n   ⚠️  DUPLICATE CLEANUP RECOMMENDED")
+                print(f"   Run cleanup_duplicate_rows() to remove duplicate records")
+            else:
+                print(f"\n   ✅ All tables clean - no duplicates detected")
+                
+    except Exception as e:
+        print(f"⚠️ Duplicate detection warning: {e}")
+
+
+def cleanup_duplicate_rows(conn) -> None:
+    """
+    Remove duplicate rows from all tables, keeping the most recent version
+    Removes duplicates from:
+      - landing.raw_jobs (keeps by max ctid)
+      - staging.jobs_v1 (keeps by max ctid)
+      - staging.job_skills (keeps by max ctid)
+    
+    This function is idempotent and safe to run multiple times
+    """
+    try:
+        with conn.cursor() as cur:
+            print(f"\n🧹 Starting duplicate cleanup...\n")
+            
+            # Cleanup 1: landing.raw_jobs duplicates
+            cur.execute("""
+                DELETE FROM landing.raw_jobs
+                WHERE ctid NOT IN (
+                    SELECT MAX(ctid)
+                    FROM landing.raw_jobs
+                    GROUP BY source_name, job_id
+                )
+            """)
+            landing_removed = cur.rowcount
+            if landing_removed > 0:
+                print(f"   🗑️  landing.raw_jobs: Removed {landing_removed} duplicate rows")
+            
+            # Cleanup 2: staging.jobs_v1 duplicates
+            cur.execute("""
+                DELETE FROM staging.jobs_v1
+                WHERE ctid NOT IN (
+                    SELECT MAX(ctid)
+                    FROM staging.jobs_v1
+                    GROUP BY source_name, job_id
+                )
+            """)
+            staging_removed = cur.rowcount
+            if staging_removed > 0:
+                print(f"   🗑️  staging.jobs_v1: Removed {staging_removed} duplicate rows")
+            
+            # Cleanup 3: staging.job_skills duplicates (same job-skill pair)
+            cur.execute("""
+                DELETE FROM staging.job_skills
+                WHERE ctid NOT IN (
+                    SELECT MAX(ctid)
+                    FROM staging.job_skills
+                    GROUP BY source_name, job_id, skill
+                )
+            """)
+            skills_removed = cur.rowcount
+            if skills_removed > 0:
+                print(f"   🗑️  staging.job_skills: Removed {skills_removed} duplicate rows")
+            
+            conn.commit()
+            
+            total_removed = landing_removed + staging_removed + skills_removed
+            if total_removed > 0:
+                print(f"\n   ✅ Cleanup complete: {total_removed} duplicate rows removed")
+            else:
+                print(f"\n   ✅ No duplicates found - tables already clean")
+            
+            # Verify cleanup
+            print(f"\n📋 Verification after cleanup:")
+            
+            cur.execute("""
+                SELECT 
+                    (SELECT COUNT(*) FROM landing.raw_jobs) as landing_total,
+                    (SELECT COUNT(DISTINCT (source_name, job_id)) FROM landing.raw_jobs) as landing_unique,
+                    (SELECT COUNT(*) FROM staging.jobs_v1) as staging_total,
+                    (SELECT COUNT(DISTINCT (source_name, job_id)) FROM staging.jobs_v1) as staging_unique,
+                    (SELECT COUNT(*) FROM staging.job_skills) as skills_total,
+                    (SELECT COUNT(DISTINCT (source_name, job_id, skill)) FROM staging.job_skills) as skills_unique
+            """)
+            
+            landing_total, landing_unique, staging_total, staging_unique, skills_total, skills_unique = cur.fetchone()
+            
+            landing_clean = landing_total == landing_unique
+            staging_clean = staging_total == staging_unique
+            skills_clean = skills_total == skills_unique
+            
+            print(f"   landing.raw_jobs: {landing_total} rows, {landing_unique} unique {('✅' if landing_clean else '⚠️')}")
+            print(f"   staging.jobs_v1: {staging_total} rows, {staging_unique} unique {('✅' if staging_clean else '⚠️')}")
+            print(f"   staging.job_skills: {skills_total} rows, {skills_unique} unique {('✅' if skills_clean else '⚠️')}")
+            
+            if landing_clean and staging_clean and skills_clean:
+                print(f"\n   ✅ All tables verified clean!")
+            else:
+                print(f"\n   ⚠️  Some tables still have duplicates - may need manual intervention")
+                
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Duplicate cleanup failed: {e}")
+        raise
+
+
+def validate_job_descriptions(conn) -> None:
+    """
+    Validate that job descriptions are not being truncated
+    Checks for suspiciously short descriptions and common truncation patterns
+    """
+    try:
+        with conn.cursor() as cur:
+            # Check description length distribution
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_jobs,
+                    COUNT(CASE WHEN LENGTH(COALESCE(job_description, '')) = 0 THEN 1 END) as no_description,
+                    COUNT(CASE WHEN LENGTH(COALESCE(job_description, '')) < 50 THEN 1 END) as very_short,
+                    COUNT(CASE WHEN LENGTH(COALESCE(job_description, '')) < 200 THEN 1 END) as short,
+                    COUNT(CASE WHEN LENGTH(COALESCE(job_description, '')) >= 500 THEN 1 END) as adequate,
+                    MIN(LENGTH(COALESCE(job_description, ''))) as min_length,
+                    MAX(LENGTH(COALESCE(job_description, ''))) as max_length,
+                    ROUND(AVG(LENGTH(COALESCE(job_description, '')))::numeric, 0) as avg_length
+                FROM staging.jobs_v1
+                WHERE source_name = 'reed'
+            """)
+            
+            row = cur.fetchone()
+            if row:
+                total, no_desc, very_short, short_desc, adequate, min_len, max_len, avg_len = row
+                
+                print(f"\n📝 Description Length Validation:")
+                print(f"   Total jobs: {total}")
+                print(f"   No description: {no_desc}")
+                print(f"   Very short (<50 chars): {very_short}")
+                print(f"   Short (<200 chars): {short_desc}")
+                print(f"   Adequate (≥500 chars): {adequate}")
+                print(f"   Range: {min_len}-{max_len} chars, Avg: {avg_len} chars")
+                
+                # Check for truncation at common lengths
+                cur.execute("""
+                    SELECT 
+                        LENGTH(job_description) as len,
+                        COUNT(*) as count
+                    FROM staging.jobs_v1
+                    WHERE source_name = 'reed' AND job_description IS NOT NULL
+                    GROUP BY LENGTH(job_description)
+                    HAVING COUNT(*) > 5
+                    ORDER BY COUNT(*) DESC
+                    LIMIT 10
+                """)
+                
+                suspicious_lengths = cur.fetchall()
+                if suspicious_lengths:
+                    # Check if many descriptions end at exact same length (sign of truncation)
+                    max_count = suspicious_lengths[0][1]
+                    truncation_risk = any(
+                        count > total * 0.05 and length in [450, 453, 500, 1000, 2000, 3000, 5000]
+                        for length, count in suspicious_lengths
+                    )
+                    
+                    if truncation_risk:
+                        print(f"   ⚠️  WARNING: Truncation detected at fixed lengths!")
+                        print(f"   Top lengths: {suspicious_lengths[:5]}")
+                        
+                        # Show details about 453-char truncation
+                        cur.execute("""
+                            SELECT COUNT(*)
+                            FROM staging.jobs_v1
+                            WHERE source_name = 'reed' AND LENGTH(COALESCE(job_description, '')) = 453
+                        """)
+                        truncated_453 = cur.fetchone()[0]
+                        if truncated_453 > 0:
+                            print(f"   📌 {truncated_453} descriptions stuck at 453 chars (Reed API limit)")
+                            print(f"      This indicates detail endpoint enrichment failed for these jobs")
+                            print(f"      Action: Re-run pipeline to retry detail endpoint calls")
+                    else:
+                        print(f"   ✅ No truncation detected")
+                else:
+                    print(f"   ✅ Description lengths are varied (no truncation pattern)")
+                    
+    except Exception as e:
+        print(f"⚠️ Description validation warning: Failed to validate descriptions: {e}")
+
+
 # ---------- Function entrypoint ----------
 
 def main(mytimer: func.TimerRequest) -> None:
@@ -1651,44 +2089,74 @@ def main(mytimer: func.TimerRequest) -> None:
             progress_pct = (len(results) / total_results * 100) if isinstance(total_results, int) else 0
             print(f"  Page {p}: +{len(page_items)} items (total: {len(results)}, ~{progress_pct:.0f}%)")
 
-    # Apply title-based include/exclude filtering
+    # Apply title-based filtering using ML classifier + rule-based fallback
     print(f"⏳ [4/8] Applying title filters...")
     def _title_of(j: Dict[str, Any]) -> str:
         return (j.get('jobTitle') or j.get('title') or "").lower()
-    include_terms = cfg.get("JOB_TITLE_INCLUDE", [])
-    exclude_terms = cfg.get("JOB_TITLE_EXCLUDE", [])
+    
     pre_filter_count = len(results)
     filtered_results = []
-    for j in results:
-        t = _title_of(j)
-        if not t:
-            continue
-        # Use word boundary matching for both include and exclude filters
-        # This prevents "bi" from matching "bid", "spiral", etc.
-        if include_terms:
-            include_match = False
-            for term in include_terms:
-                # Match term as whole word or at word boundary
-                pattern = r'\b' + re.escape(term) + r'\b'
-                if re.search(pattern, t):
-                    include_match = True
-                    break
-            if not include_match:
-                continue
+    use_ml = cfg.get("USE_ML_CLASSIFIER", False) and ML_CLASSIFIER_AVAILABLE
+    
+    # DEBUG
+    print(f"  DEBUG: USE_ML_CLASSIFIER={cfg.get('USE_ML_CLASSIFIER')}, ML_CLASSIFIER_AVAILABLE={ML_CLASSIFIER_AVAILABLE}, use_ml={use_ml}")
+    
+    if use_ml:
+        # Use ML classifier
+        print(f"  Using ML classifier for filtering...")
+        try:
+            classifier = JobClassifier()
+            ml_threshold = float(cfg.get("ML_CLASSIFIER_THRESHOLD", "0.7"))
+            
+            for j in results:
+                title = _title_of(j)
+                if not title:
+                    continue
+                
+                is_relevant, confidence = classifier.classify(title, threshold=ml_threshold)
+                if is_relevant:
+                    filtered_results.append(j)
+            
+            print(f"✅ ML Title filter: kept {len(filtered_results):,} of {pre_filter_count:,} (threshold={ml_threshold})")
+        except Exception as e:
+            print(f"⚠️  ML classifier failed ({e}); falling back to rule-based filtering...")
+            use_ml = False
+    
+    if not use_ml:
+        # Fallback: Rule-based filtering with word boundaries
+        include_terms = cfg.get("JOB_TITLE_INCLUDE", [])
+        exclude_terms = cfg.get("JOB_TITLE_EXCLUDE", [])
         
-        if exclude_terms:
-            exclude_match = False
-            for term in exclude_terms:
-                # Match term as whole word or at word boundary
-                pattern = r'\b' + re.escape(term) + r'\b'
-                if re.search(pattern, t):
-                    exclude_match = True
-                    break
-            if exclude_match:
+        for j in results:
+            t = _title_of(j)
+            if not t:
                 continue
+            
+            # Check exclude terms first
+            if exclude_terms:
+                exclude_match = False
+                for term in exclude_terms:
+                    pattern = r'\b' + re.escape(term) + r'\b'
+                    if re.search(pattern, t):
+                        exclude_match = True
+                        break
+                if exclude_match:
+                    continue
+            
+            # Check include terms
+            if include_terms:
+                include_match = False
+                for term in include_terms:
+                    pattern = r'\b' + re.escape(term) + r'\b'
+                    if re.search(pattern, t):
+                        include_match = True
+                        break
+                if not include_match:
+                    continue
+            
+            filtered_results.append(j)
         
-        filtered_results.append(j)
-    print(f"✅ Title filter: kept {len(filtered_results):,} of {pre_filter_count:,} (include={include_terms}, exclude={exclude_terms})")
+        print(f"✅ Rule-based filter: kept {len(filtered_results):,} of {pre_filter_count:,}")
 
     # Apply expiration date filtering - exclude jobs that have already expired
     print(f"⏳ [5/8] Checking job expiry dates...")
@@ -1845,6 +2313,8 @@ def main(mytimer: func.TimerRequest) -> None:
                 print(f"  Logging enrichment statistics...")
                 log_enrichment_stats(conn)
                 log_skill_extraction_stats(conn)
+                validate_job_descriptions(conn)
+                detect_and_report_duplicates(conn)
     except Exception as e:
         print(f"❌ Database step failed: {e}")
         raise
