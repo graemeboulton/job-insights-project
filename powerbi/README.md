@@ -1,4 +1,4 @@
 
 # Power BI
 
-Use PBIX or PBIT templates. Consider Git LFS for PBIX.
+Here you can find the PBIX file for the project.
