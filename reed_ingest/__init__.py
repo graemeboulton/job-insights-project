@@ -91,6 +91,11 @@ SKILL_GROUPS: Dict[str, set] = {
 # Flat set used for matching (backwards-compatible)
 SKILL_PATTERNS = set().union(*SKILL_GROUPS.values())
 
+# Permanently excluded job IDs (blacklist)
+EXCLUDED_JOB_IDS = {
+    '56140909', '56014684', '56067820', '56067821', '56067822'
+}
+
 # Job role categories - map role keywords to standardized category names
 # Format: 'category_name': {'keywords', 'to', 'match'}
 JOB_ROLE_CATEGORIES: Dict[str, set] = {
@@ -2333,6 +2338,13 @@ def main(mytimer: func.TimerRequest) -> None:
         print(f"✅ Expiry filter: all {len(expiry_filtered_results):,} jobs are active")
     
     filtered_results = expiry_filtered_results
+
+    # Permanently exclude blacklisted job IDs
+    before_blacklist = len(filtered_results)
+    filtered_results = [j for j in filtered_results if str(j.get(cfg["JOB_ID_KEY"])) not in EXCLUDED_JOB_IDS]
+    removed_blacklist = before_blacklist - len(filtered_results)
+    if removed_blacklist > 0:
+        print(f"✅ Blacklist filter: removed {removed_blacklist} jobs; {len(filtered_results):,} remain")
 
     if not filtered_results:
         print("ℹ️ No results after filtering; nothing to upsert.")
